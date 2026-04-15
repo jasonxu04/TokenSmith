@@ -59,14 +59,20 @@ clean:
 	find . -type f -name "*.pyc" -delete
 
 # PDF to Markdown extraction
+# run-extract:
+# 	@echo "Extracting PDF to markdown (data/chapters/*.pdf -> data/*.md)"
+# 	conda run --no-capture-output -n tokensmith python -m src.preprocessing.extraction
 run-extract:
 	@echo "Extracting PDF to markdown (data/chapters/*.pdf -> data/*.md)"
-	conda run --no-capture-output -n tokensmith python -m src.preprocessing.extraction
+	conda run --no-capture-output -n tokensmith python -m src.preprocessing.extraction > output.log 2>&1
 	
 # Run modes
+# run-index:
+# 	@echo "Running TokenSmith index mode with additional CLI args: $(ARGS)"
+# 	conda run --no-capture-output -n tokensmith python -m src.main index $(ARGS)
 run-index:
 	@echo "Running TokenSmith index mode with additional CLI args: $(ARGS)"
-	conda run --no-capture-output -n tokensmith python -m src.main index $(ARGS)
+	python -m src.main index $(ARGS)
 
 run-chat:
 	@echo "Running TokenSmith chat mode with additional CLI args: $(ARGS)"
