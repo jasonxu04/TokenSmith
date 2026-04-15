@@ -6,6 +6,15 @@ import sys
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption, InputFormat
 from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
+from tqdm import tqdm
+import time
+import tempfile
+import multiprocessing as mp
+from typing import Tuple
+from pypdf import PdfReader, PdfWriter
+
+_worker_converter = None
+
 
 def extract_sections_from_markdown(
     file_path: str,
@@ -50,7 +59,7 @@ def extract_sections_from_markdown(
         })
 
     # Process the rest of the chunks
-    for chunk in chunks[1:]:
+    for chunk in tqdm(chunks[1:], desc="Extracting sections", unit="section"):
         if not chunk:
             continue
         if chunk.strip():
@@ -167,58 +176,268 @@ def extract_index_with_range_expansion(text_content):
     # Convert the dictionary to a nicely formatted JSON string
     return json.dumps(index_data, indent=2)
 
-def convert_and_save_with_page_numbers(input_file_path, output_file_path):
-    """
-    Converts a document to Markdown, iterating page by page
-    to insert a custom footer with the page number after each page,
-    and saves the result to a file.
+# def convert_and_save_with_page_numbers(input_file_path, output_file_path):
+#     """
+#     Converts a document to Markdown, iterating page by page
+#     to insert a custom footer with the page number after each page,
+#     and saves the result to a file.
     
-    Args:
-        input_file_path (str): The path to the source file (e.g., "/path/to/file.pdf").
-        output_file_path (str): The path to the destination .md file.
-    """
+#     Args:
+#         input_file_path (str): The path to the source file (e.g., "/path/to/file.pdf").
+#         output_file_path (str): The path to the destination .md file.
+#     """
     
+#     source = Path(input_file_path)
+#     if not source.exists():
+#         print(f"Error: Input file not found at {input_file_path}", file=sys.stderr)
+#         return
+
+#     # Disable OCR and table structure extraction for faster processing
+#     pipeline_options = PdfPipelineOptions()
+#     pipeline_options.do_ocr = False
+#     pipeline_options.do_table_structure = False
+
+#     converter = DocumentConverter(
+#     format_options={
+#             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options, backend=DoclingParseV2DocumentBackend)
+#         }
+#     )
+    
+#     try:
+#         # Convert the entire document once
+#         result = converter.convert(source)
+#     except Exception as e:
+#         print(f"Error during conversion: {e}", file=sys.stderr)
+#         return
+        
+#     doc = result.document
+
+#     # Define a unique placeholder that won't appear in the text.
+#     # Using "\n" ensures it's on its own line.
+#     UNIQUE_PLACEHOLDER = "\n%%%__DOCLING_PAGE_BREAK__%%%\n"
+
+#     # Export the entire document at once, using our placeholder.
+#     # This avoids the fragile doc.filter() method.
+#     try:
+#         full_markdown = doc.export_to_markdown(page_break_placeholder=UNIQUE_PLACEHOLDER)
+#     except Exception as e:
+#         print(f"Error during final markdown export: {e}", file=sys.stderr)
+#         print("Falling back to exporting document without page numbers.")
+#         try:
+#             # Fallback: just save the raw export
+#             with open(output_file_path, "w", encoding="utf-8") as f:
+#                 f.write(doc.export_to_markdown())
+#             print(f"Successfully saved (fallback, no page numbers) to {output_file_path}")
+#         except IOError as e_io:
+#             print(f"Error writing fallback file: {e_io}", file=sys.stderr)
+#         return
+
+#     # Split the full markdown by our unique placeholder.
+#     # This gives us a list where each item is one page's content.
+#     markdown_pages = full_markdown.split(UNIQUE_PLACEHOLDER)
+    
+#     final_output_chunks = []
+    
+#     # Iterate through the pages, adding our custom footer.
+#     # We use enumerate to get a 1-based page number.
+#     num_pages = len(markdown_pages)
+#     for i, page_content in enumerate(
+#         tqdm(markdown_pages, desc="Processing pages", unit="page"),
+#         1
+#     ):
+#         # Add the content for the current page
+#         final_output_chunks.append(page_content)
+        
+#         # Add our custom footer, but not after the very last page
+#         if i < num_pages:
+#             final_output_chunks.append(f"\n\n--- Page {i} ---\n\n")
+
+#     # Write the combined markdown string to the output file
+#     try:
+#         with open(output_file_path, "w", encoding="utf-8") as f:
+#             f.write("".join(final_output_chunks))
+#         print(f"Successfully converted and saved to {output_file_path}")
+#     except IOError as e:
+#         print(f"Error writing to file {output_file_path}: {e}", file=sys.stderr)
+#     except Exception as e:
+#         print(f"An unexpected error occurred: {e}", file=sys.stderr)
+
+def convert_and_save_with_page_numbers(
+    input_file_path,
+    output_file_path,
+    shard_size: int = 50,
+    num_workers: int = 4,
+):
+    """
+    Converts a large PDF to Markdown using page-range sharding,
+    then merges the shard outputs into one Markdown file with
+    global page markers.
+    """
     source = Path(input_file_path)
     if not source.exists():
         print(f"Error: Input file not found at {input_file_path}", file=sys.stderr)
         return
 
-    # Disable OCR and table structure extraction for faster processing
+    try:
+        num_pages = get_pdf_page_count(source)
+    except Exception as e:
+        print(f"Error reading page count from {input_file_path}: {e}", file=sys.stderr)
+        return
+
+    page_ranges = make_page_ranges(num_pages, shard_size)
+
+    print(
+        f"Converting '{source.name}' with page-range sharding: "
+        f"{num_pages} pages, {len(page_ranges)} shards, shard_size={shard_size}, workers={num_workers}"
+    )
+
+    temp_root = Path(tempfile.mkdtemp(prefix="pdf_shards_"))
+
+    try:
+        worker_args = [
+            (str(source), str(temp_root), start_page, end_page)
+            for start_page, end_page in page_ranges
+        ]
+
+        if num_workers > 1 and len(page_ranges) > 1:
+            with mp.Pool(processes=min(num_workers, len(page_ranges)), initializer=_init_range_worker,) as pool:
+                shard_results = list(
+                    tqdm(
+                        pool.imap(_process_range_worker, worker_args),
+                        total=len(worker_args),
+                        desc="Converting page ranges",
+                        unit="range",
+                    )
+                )
+        else:
+            shard_results = [
+                _process_range_worker(args)
+                for args in tqdm(
+                    worker_args,
+                    total=len(worker_args),
+                    desc="Converting page ranges",
+                    unit="range",
+                )
+            ]
+
+        # Keep final output in page order
+        shard_results.sort(key=lambda x: x[0])
+
+        merged_chunks = []
+        for idx, (_, _, shard_md) in enumerate(shard_results):
+            merged_chunks.append(shard_md)
+
+            if idx < len(shard_results) - 1 and not shard_md.endswith("\n"):
+                merged_chunks.append("\n")
+
+        final_markdown = "".join(merged_chunks)
+
+        with open(output_file_path, "w", encoding="utf-8") as f:
+            f.write(final_markdown)
+
+        print(f"Successfully converted and saved to {output_file_path}")
+
+    except Exception as e:
+        print(f"Sharded conversion failed: {e}", file=sys.stderr)
+    finally:
+        for p in temp_root.glob("*"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        try:
+            temp_root.rmdir()
+        except Exception:
+            pass
+
+def get_pdf_page_count(pdf_path: Path) -> int:
+    reader = PdfReader(str(pdf_path))
+    return len(reader.pages)
+
+def make_page_ranges(num_pages: int, shard_size: int) -> List[Tuple[int, int]]:
+    ranges = []
+    start = 1
+    while start <= num_pages:
+        end = min(start + shard_size - 1, num_pages)
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+def write_pdf_range(source_pdf: Path, out_pdf: Path, start_page: int, end_page: int) -> None:
+    """
+    start_page/end_page are 1-based inclusive.
+    """
+    reader = PdfReader(str(source_pdf))
+    writer = PdfWriter()
+
+    for page_idx in range(start_page - 1, end_page):
+        writer.add_page(reader.pages[page_idx])
+
+    with open(out_pdf, "wb") as f:
+        writer.write(f)
+
+def build_converter() -> DocumentConverter:
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = False
     pipeline_options.do_table_structure = False
 
-    converter = DocumentConverter(
-    format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options, backend=DoclingParseV2DocumentBackend)
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options,
+                backend=DoclingParseV2DocumentBackend
+            )
         }
     )
-    
-    try:
-        # Convert the entire document once
-        result = converter.convert(source)
-    except Exception as e:
-        print(f"Error during conversion: {e}", file=sys.stderr)
-        return
-        
+
+def _init_range_worker():
+    global _worker_converter
+    _worker_converter = build_converter()
+
+def convert_pdf_range_to_markdown(
+    source_pdf: Path,
+    temp_dir: Path,
+    start_page: int,
+    end_page: int,
+) -> Tuple[int, int, str]:
+    """
+    Convert one page range and return:
+    (start_page, end_page, markdown_text_with_global_page_markers)
+    """
+    shard_pdf = temp_dir / f"shard_{start_page}_{end_page}.pdf"
+    write_pdf_range(source_pdf, shard_pdf, start_page, end_page)
+
+    converter = _worker_converter
+    if converter is None:
+        converter = build_converter()
+
+    result = converter.convert(shard_pdf)
     doc = result.document
 
-    num_pages = len(doc.pages)
-    
-    # Extract markdown and append page number footer except for the last page
-    final_text = "".join(
-        doc.export_to_markdown(page_no=i) + (f"\n\n--- Page {i} ---\n\n" if i < num_pages else "")
-        for i in range(1, num_pages + 1)
+    unique_placeholder = "\n%%%__DOCLING_PAGE_BREAK__%%%\n"
+    shard_markdown = doc.export_to_markdown(page_break_placeholder=unique_placeholder)
+    markdown_pages = shard_markdown.split(unique_placeholder)
+
+    final_output_chunks = []
+    num_local_pages = len(markdown_pages)
+
+    for local_idx, page_content in enumerate(markdown_pages, 1):
+        global_page_num = start_page + local_idx - 1
+        final_output_chunks.append(page_content)
+
+        if local_idx < num_local_pages:
+            final_output_chunks.append(f"\n\n--- Page {global_page_num} ---\n\n")
+
+    return start_page, end_page, "".join(final_output_chunks)
+
+def _process_range_worker(args) -> Tuple[int, int, str]:
+    source_pdf, temp_dir_str, start_page, end_page = args
+    return convert_pdf_range_to_markdown(
+        Path(source_pdf),
+        Path(temp_dir_str),
+        start_page,
+        end_page,
     )
-
-    # Write the combined markdown string to the output file
-    try:
-        with open(output_file_path, "w", encoding="utf-8") as f:
-            f.write(final_text)
-        print(f"Successfully converted and saved to {output_file_path}")
-    except Exception as e:
-        print(f"Error writing to file {output_file_path}: {e}", file=sys.stderr)
-
 
 def preprocess_extracted_section(text: str) -> str:
     """
@@ -256,17 +475,25 @@ def main():
 
     # Convert each PDF to Markdown
     markdown_files = []
-    for pdf_path in pdfs:
+    for pdf_path in tqdm(pdfs, desc="Extracting PDFs", unit="pdf"):
         pdf_name = pdf_path.stem
         output_md = Path("data") / f"{pdf_name}--extracted_markdown.md"
 
         print(f"Converting '{pdf_path}' to '{output_md}'...")
-        convert_and_save_with_page_numbers(str(pdf_path), str(output_md))
+
+        start = time.time()
+        convert_and_save_with_page_numbers(str(pdf_path), str(output_md), 
+                                           shard_size=50,num_workers=2,)
+        end = time.time()
+        print(f"[Timing] Conversion took {end - start:.2f}s")
 
         markdown_files.append(output_md)
 
     # TODO: Add logic to select which markdown file to process
+    start = time.time()
     extracted_sections = extract_sections_from_markdown(markdown_files[0])
+    end = time.time()
+    print(f"[Timing] Section extraction took {end - start:.2f}s")
     # print(f"Processing markdown file: {markdown_files[0]}")
 
     if extracted_sections:

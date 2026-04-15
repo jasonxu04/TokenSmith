@@ -2,6 +2,9 @@
 """
 index_builder.py
 PDF -> markdown text -> chunks -> embeddings -> BM25 + FAISS + metadata
+
+Entry point (called by main.py):
+    build_index(markdown_file, cfg, keep_tables=True, do_visualize=False)
 """
 
 import os
@@ -11,13 +14,20 @@ import re
 import json
 from typing import List, Dict
 
-import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
 from src.embedder import SentenceTransformer
 
-from src.preprocessing.chunking import DocumentChunker, ChunkConfig, print_chunk_stats
+from src.preprocessing.chunking import DocumentChunker, ChunkConfig
 from src.preprocessing.extraction import extract_sections_from_markdown
+from src.section_processor import (
+    build_full_section_paths,
+    build_section_start_pages,
+    init_section_worker,
+    process_section,
+)
+import multiprocessing as mp
+from tqdm import tqdm
 
 # ----- runtime parallelism knobs (avoid oversubscription) -----
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -27,8 +37,10 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
+# Default keywords to exclude sections
 DEFAULT_EXCLUSION_KEYWORDS = ['questions', 'exercises', 'summary', 'references']
 
+# ------------------------ Main index builder -----------------------------
 
 def build_index(
     markdown_file: str,
@@ -36,11 +48,10 @@ def build_index(
     chunker: DocumentChunker,
     chunk_config: ChunkConfig,
     embedding_model_path: str,
-    embedding_model_context_window: int,
     artifacts_dir: os.PathLike,
     index_prefix: str,
-    use_multiprocessing: bool = False,
-    use_headings: bool = False,
+    use_multiprocessing: bool = True,
+    use_headings: bool = False
 ) -> None:
     """
     Extract sections, chunk, embed, and build both FAISS and BM25 indexes.
@@ -51,7 +62,6 @@ def build_index(
         - {prefix}_chunks.pkl
         - {prefix}_sources.pkl
         - {prefix}_meta.pkl
-        - {prefix}_page_to_chunk_map.json
     """
     all_chunks: List[str] = []
     sources: List[str] = []
@@ -141,29 +151,106 @@ def build_index(
     # Print chunk stats before embedding - TODO: wrap in some verbose cfg param
     # print_chunk_stats(all_chunks, chunk_size_in_chars=chunk_config.recursive_chunk_size)
 
-    # Step 2: Load embedder
-    print(f"Loading embedding model (n_ctx={embedding_model_context_window})...")
-    embedder = SentenceTransformer(
-        embedding_model_path,
-        n_ctx=embedding_model_context_window,
-    )
-    print(f"Embedding {len(all_chunks):,} chunks sequentially...")
+
+
+
+
+    # page_to_chunk_ids = {}
+
+    # # Precompute serial state that depends on section order
+    # full_section_paths = build_full_section_paths(sections)
+    # section_start_pages = build_section_start_pages(sections)
+
+    # worker_args = [
+    #     (
+    #         sections[i],
+    #         full_section_paths[i],
+    #         section_start_pages[i],
+    #         markdown_file,
+    #         chunk_config.to_string(),
+    #         use_headings,
+    #         chunk_config,
+    #     )
+    #     for i in range(len(sections))
+    # ]
+
+    # # Step 1 with multiprocessing
+    # use_section_mp = use_multiprocessing and len(sections) > 8
+
+    # if use_section_mp:
+    #     num_workers = min(mp.cpu_count() or 1, 8)
+    #     print(f"Processing {len(sections):,} sections with {num_workers} workers...")
+
+    #     with mp.Pool(
+    #         processes=num_workers,
+    #         initializer=init_section_worker,
+    #         initargs=(chunk_config,),
+    #     ) as pool:
+    #         section_results = list(
+    #             tqdm(
+    #                 pool.imap(process_section, worker_args),
+    #                 total=len(worker_args),
+    #                 desc="Processing sections",
+    #                 unit="section",
+    #             )
+    #         )
+    # else:
+    #     section_results = [process_section(args) for args in worker_args]
+
+    # total_chunks = 0
+
+    # for result in section_results:
+    #     for chunk_text, source, meta in zip(
+    #         result["all_chunks"],
+    #         result["sources"],
+    #         result["metadata"],
+    #     ):
+    #         meta["chunk_id"] = total_chunks
+
+    #         all_chunks.append(chunk_text)
+    #         sources.append(source)
+    #         metadata.append(meta)
+
+    #         for page in meta["page_numbers"]:
+    #             page_to_chunk_ids.setdefault(page, set()).add(total_chunks)
+
+    #         total_chunks += 1
+
+    # # Convert the sets to sorted lists for a clean, predictable output
+    # final_map = {}
+    # for page, id_set in page_to_chunk_ids.items():
+    #     final_map[page] = sorted(list(id_set))
+
+    # output_file = artifacts_dir / f"{index_prefix}_page_to_chunk_map.json"
+    # with open(output_file, "w") as f:
+    #     json.dump(final_map, f, indent=2)
+    # print(f"Saved page to chunk ID map: {output_file}")
+
+    # Step 2: Create embeddings for FAISS index
+    print(f"Embedding {len(all_chunks):,} chunks with {pathlib.Path(embedding_model_path).stem} ...")
+    embedder = SentenceTransformer(embedding_model_path)
 
     if use_multiprocessing:
         print("Starting multi-process pool for embeddings...")
+        # Start the pool. Adjust number of workers as needed.
         pool = embedder.start_multi_process_pool(workers=4)
         try:
+            # Compute embeddings in parallel
             embeddings = embedder.encode_multi_process(
-                all_chunks,
-                pool,
-                batch_size=4,
+                all_chunks, 
+                pool, 
+                batch_size=32
             )
         finally:
+            # Stop the pool to prevent hanging processes
             embedder.stop_multi_process_pool(pool)
     else:
+        # Standard single-process embedding
         embeddings = embedder.encode(
-            all_chunks,
+            all_chunks, 
+            batch_size=8, 
             show_progress_bar=True,
+            convert_to_numpy=True 
         )
 
     # Step 3: Build FAISS index
@@ -172,7 +259,7 @@ def build_index(
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
     faiss.write_index(index, str(artifacts_dir / f"{index_prefix}.faiss"))
-    print(f"FAISS index built: {index_prefix}.faiss")
+    print(f"FAISS Index built successfully: {index_prefix}.faiss")
 
     # Step 4: Build BM25 index
     print(f"Building BM25 index for {len(all_chunks):,} chunks...")
@@ -180,9 +267,9 @@ def build_index(
     bm25_index = BM25Okapi(tokenized_chunks)
     with open(artifacts_dir / f"{index_prefix}_bm25.pkl", "wb") as f:
         pickle.dump(bm25_index, f)
-    print(f"BM25 index built: {index_prefix}_bm25.pkl")
+    print(f"BM25 Index built successfully: {index_prefix}_bm25.pkl")
 
-    # Step 5: Persist remaining artifacts
+    # Step 5: Dump index artifacts
     with open(artifacts_dir / f"{index_prefix}_chunks.pkl", "wb") as f:
         pickle.dump(all_chunks, f)
     with open(artifacts_dir / f"{index_prefix}_sources.pkl", "wb") as f:
@@ -191,9 +278,20 @@ def build_index(
         pickle.dump(metadata, f)
     print(f"Saved all index artifacts with prefix: {index_prefix}")
 
+# ------------------------ Helper functions ------------------------------
 
 def preprocess_for_bm25(text: str) -> list[str]:
-    """Lowercase and tokenize text for BM25 indexing."""
+    """
+    Simplifies text to keep only letters, numbers, underscores, hyphens,
+    apostrophes, plus, and hash — suitable for BM25 tokenization.
+    """
+    # Convert to lowercase
     text = text.lower()
+
+    # Keep only allowed characters
     text = re.sub(r"[^a-z0-9_'#+-]", " ", text)
-    return text.split()
+
+    # Split by whitespace
+    tokens = text.split()
+
+    return tokens
